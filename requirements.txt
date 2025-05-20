@@ -10,3 +10,4 @@ rembg
 opencv-python
 pydantic
 gunicorn
+onnxruntime
