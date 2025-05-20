@@ -63,7 +63,7 @@ class PersonDetector:
         # Load the TFLite model
         self.interpreter = self.load_model()
         # Colors for drawing boundaries
-        self.boundary_color = (0, 255, 0)  # Green color for boundaries
+        self.boundary_color = (255, 255, 255)  # White color for boundaries
         self.box_color = (0, 255, 0)  # Green color for bounding boxes
         self.text_color = (0, 0, 0)  # Black color for text
 
