@@ -1,0 +1,12 @@
+numpy==1.24.3
+tensorflow==2.12.0
+tensorflow-hub==0.13.0
+Pillow==9.5.0
+matplotlib==3.7.1
+fastapi==0.95.2
+uvicorn==0.22.0
+python-multipart==0.0.6
+rembg==2.0.50
+opencv-python==4.7.0.72
+pydantic==1.10.8
+gunicorn==20.1.0
