@@ -27,7 +27,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 PROCESSED_DIR.mkdir(exist_ok=True)
 BACKGROUND_DIR.mkdir(exist_ok=True)
-
+aiml_api_key = os.getenv("AIML_API_KEY")
 aiml_client = OpenAI(
     api_key=aiml_api_key,
     base_url="https://api.aimlapi.com/v1"
