@@ -39,3 +39,4 @@ processed/
 .vscode/
 *.swp
 *.swo
+.env

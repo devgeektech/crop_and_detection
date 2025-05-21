@@ -2,6 +2,73 @@
 
 This is a FastAPI-based web API for the Person Detector and Cropper application. It allows you to detect persons in images, crop them with background removal, and draw boundaries around detected objects.
 
+## Simplified API Structure
+
+The API has been simplified to just two endpoints:
+
+### 1. POST /process
+
+This is the main endpoint that handles everything in a single API call:
+- Upload an image
+- Detect persons
+- Extract a clicked person (optional)
+- Remove background
+
+**Request:**
+- Form data with:
+  - `file`: The image file to process (required)
+  - `click_x`: X coordinate of the click (optional)
+  - `click_y`: Y coordinate of the click (optional)
+  - `draw_boundary`: Whether to draw white boundaries (default: true)
+
+**Response (JSON):**
+```json
+{
+  "image_id": "unique-id",
+  "detected_image_url": "/image/unique-id_detected.png",
+  "extracted_image_url": "/image/unique-id_0_extracted.png",
+  "clean_image_url": "/image/unique-id_0_clean.png",
+  "full_image_url": "/image/unique-id_full_removed_bg.png",
+  "detections": [
+    {
+      "id": "0",
+      "box": [0.1, 0.2, 0.3, 0.4],
+      "score": 0.95
+    }
+  ]
+}
+```
+
+**Usage Examples:**
+
+1. **Just detect persons in an image**:
+   - Send only the `file` parameter
+   - The response will include the `detected_image_url` and `detections` list
+
+2. **Detect and extract a specific person**:
+   - Send the `file`, `click_x`, and `click_y` parameters
+   - The response will include all image URLs
+
+### 2. GET /image/{filename}
+
+This endpoint retrieves the processed images.
+
+**Request:**
+- URL parameter: `filename` - The filename from any of the URLs in the `/process` response
+
+**Response:**
+- The actual image file
+
+**Example:**
+```
+GET /image/unique-id_detected.png
+```
+
+When deployed on Render, the full URL would be:
+```
+https://your-app-name.onrender.com/image/unique-id_detected.png
+```
+
 ## Features
 
 - Person detection using TensorFlow Lite
