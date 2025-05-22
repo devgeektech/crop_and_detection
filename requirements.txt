@@ -4,10 +4,15 @@ tensorflow-hub
 Pillow
 matplotlib
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 rembg
 opencv-python
 pydantic
 gunicorn
 onnxruntime
+aiofiles
+python-jose[cryptography]
+aioredis
+starlette
+asyncio

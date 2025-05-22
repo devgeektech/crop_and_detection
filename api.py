@@ -93,27 +93,44 @@ class ExtractedObject(BaseModel):
     clean_filename: Optional[str] = None  
     full_image_filename: Optional[str] = None 
 
-def generate_background_suggestions(image_path=None):
+def generate_background_suggestions(image_path=None, existing_suggestions=None):
     """Generate background suggestions using OpenAI API based on the image"""
+
+    existing_suggestions = existing_suggestions or []
+
+    def suggestion_key(s):
+        # Normalize name to compare duplicates
+        return s.name.strip().lower()
+
     try:
         fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
         fallback_result = [
             BackgroundSuggestion(name=bg, description=f"A {bg} background") 
             for bg in fallback_suggestions
         ]
-        
+
         if not openai.api_key:
             print("No OpenAI API key provided, using fallback background suggestions")
-            return fallback_result
-        
+            combined = existing_suggestions + fallback_result
+            # Remove duplicates based on name
+            unique = []
+            seen = set()
+            for s in combined:
+                k = suggestion_key(s)
+                if k not in seen:
+                    unique.append(s)
+                    seen.add(k)
+            print(f"Returning {len(unique[:5])} suggestions after fallback")
+            return unique[:5]
+
         image_description = "a person's photo"
-        
+
         if image_path and os.path.exists(image_path):
             try:
                 with open(image_path, "rb") as image_file:
                     import base64
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-                
+
                 try:
                     vision_response = aiml_client.chat.completions.create(
                         model="gpt-4-vision-preview",
@@ -131,7 +148,6 @@ def generate_background_suggestions(image_path=None):
                         ],
                         max_tokens=100
                     )
-                    
                     image_description = vision_response.choices[0].message.content
                 except Exception as e:
                     print(f"Error in GPT-4 Vision API call: {e}")
@@ -139,7 +155,7 @@ def generate_background_suggestions(image_path=None):
                 print(f"Image description: {image_description}")
             except Exception as e:
                 print(f"Error analyzing image: {e}")
-        
+
         try:
             response = aiml_client.chat.completions.create(
                 model="gpt-3.5-turbo",
@@ -152,49 +168,84 @@ def generate_background_suggestions(image_path=None):
             )
         except Exception as e:
             print(f"Error with AIML API chat completion: {e}")
-            return fallback_result
-        
+            combined = existing_suggestions + fallback_result
+            # Remove duplicates
+            unique = []
+            seen = set()
+            for s in combined:
+                k = suggestion_key(s)
+                if k not in seen:
+                    unique.append(s)
+                    seen.add(k)
+            return unique[:5]
+
         content = response.choices[0].message.content
-        
         suggestions = []
         lines = content.strip().split('\n')
-        
+
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-                
-            if line.startswith(('1.', '2.', '3.', '•', '-', '*')) or line[0].isdigit() and line[1:3] in ('. ', ') '):
-                line = line.split(' ', 1)[1].strip() if ' ' in line else line
-                
+
+            if line.startswith(('1.', '2.', '3.', '•', '-', '*')) or (line[0].isdigit() and line[1:3] in ('. ', ') ')):
+                # Remove leading bullet number etc
+                if ' ' in line:
+                    line = line.split(' ', 1)[1].strip()
+
                 if ':' in line:
                     name, description = line.split(':', 1)
                     suggestions.append(BackgroundSuggestion(name=name.strip(), description=description.strip()))
                 else:
                     suggestions.append(BackgroundSuggestion(name=line, description=line))
-        
+
         if not suggestions or len(suggestions) < 3:
             words = content.replace('.', ' ').replace(',', ' ').split()
             potential_names = [w for w in words if len(w) > 4 and w.lower() not in ['background', 'suggest', 'creative', 'photo']]
-            
+
             while len(potential_names) < 3:
                 potential_names.append(random.choice(DEFAULT_BACKGROUND_OPTIONS))
-                
+
             suggestions = [
                 BackgroundSuggestion(name=name, description=f"A {name.lower()} background") 
                 for name in random.sample(potential_names, min(3, len(potential_names)))
             ]
-        
-        return suggestions[:3]  # Return at most 3 suggestions
-        
+
+        # Merge with existing suggestions - only add new unique names
+        existing_keys = {suggestion_key(s) for s in existing_suggestions}
+        new_unique_suggestions = [s for s in suggestions if suggestion_key(s) not in existing_keys]
+
+        combined = existing_suggestions + new_unique_suggestions
+
+        # Deduplicate again just in case
+        seen = set()
+        unique_combined = []
+        for s in combined:
+            k = suggestion_key(s)
+            if k not in seen:
+                unique_combined.append(s)
+                seen.add(k)
+
+        # Return last 5 suggestions (most recent)
+        print(f"Returning {len(unique_combined[-5:])} suggestions (latest 5)")
+        return unique_combined[-5:]
+
     except Exception as e:
         print(f"Error generating background suggestions: {e}")
-        # Fallback to default options
         suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
-        return [
+        fallback_combined = existing_suggestions + [
             BackgroundSuggestion(name=bg, description=f"A {bg} background") 
             for bg in suggestions
         ]
+        # Deduplicate fallback combined
+        seen = set()
+        unique_fallback = []
+        for s in fallback_combined:
+            k = suggestion_key(s)
+            if k not in seen:
+                unique_fallback.append(s)
+                seen.add(k)
+        return unique_fallback[-5:]
 
 def combine_with_background(foreground_image, background_image, position="center", scale=1.0):
     """Combine a foreground image (with transparency) with a background image"""
@@ -350,7 +401,7 @@ def generate_background_image(description, size=(1024, 1024)):
         # Generate image with DALL-E 2
         try:
             response = aiml_client.images.generate(
-                model="dall-e-2",
+                model="mistralai/codestral-2501",
                 prompt=enhanced_prompt,
                 size="1024x1024",
                 quality="standard",
@@ -914,7 +965,7 @@ class CombinedResponse(BaseModel):
 @app.post("/process", response_model=CombinedResponse)
 async def process_image(
     request: Request,
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = None,
     click_x: Optional[int] = Form(None),
     click_y: Optional[int] = Form(None),
     draw_boundary: bool = Form(True),
@@ -929,32 +980,57 @@ async def process_image(
     text_position: str = Form("bottom"),
     text_outline_color: Optional[str] = Form("black")
 ):
-    image_id = str(uuid.uuid4())
-    file_extension = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
-    upload_path = UPLOAD_DIR / f"{image_id}{file_extension}"
+    # Validate that either file or valid click coordinates are provided
+    if file is None and (click_x is None or click_y is None):
+        raise HTTPException(status_code=400, detail="Either file or valid click coordinates must be provided")
 
-    with open(upload_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # If no file is provided, check if we have an existing image_id in the metadata
+    if file is None:
+        # Get the image_id from metadata based on click coordinates
+        for img_id, metadata in IMAGE_METADATA.items():
+            detections = [DetectionResult(**det) for det in metadata["detections"]]
+            selected = detector.find_object_at_coordinates(
+                detections, click_x, click_y, 
+                metadata["height"], metadata["width"]
+            )
+            if selected:
+                image_id = img_id
+                image = cv2.imread(metadata["path"])
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                height, width = metadata["height"], metadata["width"]
+                detections = [DetectionResult(**det) for det in metadata["detections"]]
+                break
+        else:
+            raise HTTPException(status_code=400, detail="No matching image found for the given coordinates")
+    else:
+        # Process new uploaded file
+        image_id = str(uuid.uuid4())
+        file_extension = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
+        upload_path = UPLOAD_DIR / f"{image_id}{file_extension}"
 
-    image = cv2.imread(str(upload_path))
-    if image is None:
-        raise HTTPException(status_code=400, detail="Could not read the uploaded image")
+        with open(upload_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    height, width = image.shape[:2]
+        image = cv2.imread(str(upload_path))
+        if image is None:
+            raise HTTPException(status_code=400, detail="Could not read the uploaded image")
 
-    detections = detector.detect_objects(image)
-    vis_img = detector.draw_detection_boxes(image, detections)
-    vis_filename = f"{image_id}_detected.png"
-    vis_path = PROCESSED_DIR / vis_filename
-    cv2.imwrite(str(vis_path), cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        height, width = image.shape[:2]
 
-    IMAGE_METADATA[image_id] = {
-        "path": str(upload_path),
-        "detections": [det.dict() for det in detections],
-        "height": height,
-        "width": width
-    }
+        detections = detector.detect_objects(image)
+        vis_img = detector.draw_detection_boxes(image, detections)
+        vis_filename = f"{image_id}_detected.png"
+        vis_path = PROCESSED_DIR / vis_filename
+        cv2.imwrite(str(vis_path), cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
+
+        IMAGE_METADATA[image_id] = {
+            "path": str(upload_path),
+            "detections": [det.dict() for det in detections],
+            "height": height,
+            "width": width,
+            "background_suggestions": []  # Store suggestions here
+        }
 
     base_url = str(request.base_url).rstrip('/')
     if not base_url.endswith('/'):
@@ -972,7 +1048,19 @@ async def process_image(
     )
 
     try:
-        suggestions = generate_background_suggestions(image_path=str(upload_path))
+        # Get existing suggestions from metadata
+        existing_suggestions = []
+        if image_id in IMAGE_METADATA:
+            existing_suggestions = [BackgroundSuggestion(**s) for s in IMAGE_METADATA[image_id].get('background_suggestions', [])]
+            print(f"Found {len(existing_suggestions)} existing suggestions")
+        
+        # Generate new suggestions and combine with existing
+        suggestions = generate_background_suggestions(image_path=str(upload_path), existing_suggestions=existing_suggestions)
+        
+        # Store updated suggestions in metadata
+        if image_id in IMAGE_METADATA:
+            IMAGE_METADATA[image_id]['background_suggestions'] = [s.dict() for s in suggestions]
+        
         response.background_suggestions = suggestions
         print(f"Generated background suggestions: {[s.name for s in suggestions]}")
     except Exception as e:
