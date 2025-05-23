@@ -16,7 +16,8 @@ import random
 from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
-
+from pydantic import ValidationError
+from datetime import datetime
 load_dotenv()
 
 UPLOAD_DIR = Path("uploads")
@@ -395,7 +396,7 @@ def generate_background_image(description, size=(1024, 1024)):
             return None
             
         # Enhance the description for better background generation
-        enhanced_prompt = f"A person standing in front of {description}, realistic, high quality, full background"
+        enhanced_prompt = f"according to the image {description}, realistic, high quality, full background"
         print(f"Generating DALL-E image with prompt: {enhanced_prompt}")
         
         # Generate image with DALL-E 2
@@ -410,7 +411,7 @@ def generate_background_image(description, size=(1024, 1024)):
         except Exception as e:
             print(f"Error in DALL-E API call: {e}")
             # Try with a simpler prompt if the original fails
-            simplified_prompt = f"A person standing in front of {description}, photo realistic"
+            simplified_prompt = f" provide realistic {description}, photo "
             print(f"Trying with simplified prompt: {simplified_prompt}")
             try:
                 response = aiml_client.images.generate(
@@ -943,6 +944,7 @@ class BackgroundSuggestion(BaseModel):
 
 class CombinedResponse(BaseModel):
     image_id: str
+    timestamp: str  # Added timestamp field
     detected_image_url: str
     detected_image_filename: Optional[str] = None
     extracted_image_url: Optional[str] = None
@@ -965,26 +967,159 @@ class CombinedResponse(BaseModel):
 @app.post("/process", response_model=CombinedResponse)
 async def process_image(
     request: Request,
-    file: Optional[UploadFile] = None,
-    click_x: Optional[int] = Form(None),
-    click_y: Optional[int] = Form(None),
-    draw_boundary: bool = Form(True),
-    background_name: Optional[str] = Form(None),
-    generate_background_suggestions: bool = Form(False),
-    background_position: str = Form("center"),
-    background_scale: float = Form(1.0),
-    add_text: bool = Form(False),
-    text: Optional[str] = Form(None),
-    font_size: int = Form(24),
-    text_color: str = Form("white"),
-    text_position: str = Form("bottom"),
-    text_outline_color: Optional[str] = Form("black")
+    file: Optional[UploadFile] = File(default=None),
+    click_x: Optional[int] = Form(default=None),
+    click_y: Optional[int] = Form(default=None),
+    draw_boundary: bool = Form(default=True),
+    background_name: Optional[str] = Form(default=None),
+    generate_background_suggestions: bool = Form(default=False),
+    background_position: str = Form(default="center"),
+    background_scale: float = Form(default=1.0),
+    add_text: bool = Form(default=False),
+    text: Optional[str] = Form(default=None),
+    font_size: int = Form(default=24),
+    text_color: str = Form(default="white"),
+    text_position: str = Form(default="bottom"),
+    text_outline_color: Optional[str] = Form(default="black"),
+    image_id: Optional[str] = Form(default=None),
 ):
-    # Validate that either file or valid click coordinates are provided
-    if file is None and (click_x is None or click_y is None):
-        raise HTTPException(status_code=400, detail="Either file or valid click coordinates must be provided")
+    # Get current timestamp for all responses
+    from datetime import datetime
+    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Initialize empty user suggestions list
+    user_suggestions = []
+            
+    # If image_id is provided, try to use it directly
+    if image_id and image_id in IMAGE_METADATA:
+        # Use the provided image_id
+        print(f"Using provided image_id: {image_id}")
+        
+        # Get image data from metadata
+        metadata = IMAGE_METADATA[image_id]
+        if "path" in metadata and os.path.exists(metadata["path"]):
+            image = cv2.imread(metadata["path"])
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = metadata["height"], metadata["width"]
+            detections = [DetectionResult(**det) for det in metadata["detections"]]
+            
+            # Get all existing suggestions
+            all_existing_suggestions = []
+            for meta_id, meta_data in IMAGE_METADATA.items():
+                if 'background_suggestions' in meta_data:
+                    for s in meta_data['background_suggestions']:
+                        all_existing_suggestions.append(BackgroundSuggestion(**s))
+            
+            # Generate new suggestions
+            fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+            new_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
+            
+            # Combine all suggestions
+            suggestions = []
+            if user_suggestions:
+                suggestions.extend(user_suggestions)
+            if all_existing_suggestions:
+                suggestions.extend(all_existing_suggestions)
+            suggestions.extend(new_suggestions)
+            
+            # Deduplicate and limit suggestions
+            unique_suggestions = []
+            seen = set()
+            for s in suggestions:
+                if s.name.lower() not in seen and len(unique_suggestions) < 10:  # Increased limit
+                    unique_suggestions.append(s)
+                    seen.add(s.name.lower())
+            
+            # Update metadata with new suggestions
+            IMAGE_METADATA[image_id]['background_suggestions'] = [s.dict() for s in unique_suggestions]
+            
+            # Create response
+            base_url = str(request.base_url).rstrip('/')
+            if not base_url.endswith('/'):
+                base_url += '/'
+            if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
+                base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
+                if not base_url.endswith('/'):
+                    base_url += '/'
+            
+            # Get the visualization filename if it exists
+            vis_filename = f"{image_id}_detected.png"
+            vis_path = PROCESSED_DIR / vis_filename
+            
+            response = CombinedResponse(
+                image_id=image_id,
+                timestamp=current_timestamp,
+                detected_image_url=f"{base_url}image/{vis_filename}" if os.path.exists(vis_path) else None,
+                detected_image_filename=vis_filename if os.path.exists(vis_path) else None,
+                detections=detections,
+                background_suggestions=unique_suggestions
+            )
+            
+            print(f"Returning response with {len(unique_suggestions)} suggestions for existing image_id")
+            return response
+    
+    # Handle case with no file and no coordinates and no image_id
+    if file is None and (click_x is None or click_y is None) and image_id is None:
+        # Generate new default suggestions for this refresh
+        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        new_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
+        
+        # Start with an empty list for this response
+        suggestions = []
+        
+        # Add user-provided suggestions if any
+        if user_suggestions:
+            suggestions.extend(user_suggestions)
+        
+        # Get ALL existing suggestions from ALL previous uploads
+        all_existing_suggestions = []
+        for meta_id, meta_data in IMAGE_METADATA.items():
+            if 'background_suggestions' in meta_data:
+                for s in meta_data['background_suggestions']:
+                    all_existing_suggestions.append(BackgroundSuggestion(**s))
+        
+        # Add existing suggestions to our list
+        if all_existing_suggestions:
+            suggestions.extend(all_existing_suggestions)
+            
+        # Add the new suggestions we just generated
+        suggestions.extend(new_suggestions)
+                
+        # Deduplicate and limit suggestions
+        unique_suggestions = []
+        seen = set()
+        for s in suggestions:
+            if s.name.lower() not in seen and len(unique_suggestions) < 10:  # Increased limit
+                unique_suggestions.append(s)
+                seen.add(s.name.lower())
+        suggestions = unique_suggestions
+        
+        # Create a new unique ID for this response
+        response_id = str(uuid.uuid4())
+        
+        # Store these suggestions in the metadata so they persist
+        IMAGE_METADATA[response_id] = {
+            "path": "",
+            "detections": [],
+            "height": 0,
+            "width": 0,
+            "background_suggestions": [s.dict() for s in suggestions],
+            "timestamp": current_timestamp
+        }
+        
+        # Create minimal response with timestamp and suggestions
+        minimal_response = CombinedResponse(
+            image_id=response_id,
+            timestamp=current_timestamp,
+            detected_image_url="",
+            detections=[],
+            background_suggestions=suggestions
+        )
+        
+        print(f"Returning {len(suggestions)} suggestions in minimal response")
+        return minimal_response
 
-    # If no file is provided, check if we have an existing image_id in the metadata
+    # Process with file or coordinates
     if file is None:
         # Get the image_id from metadata based on click coordinates
         for img_id, metadata in IMAGE_METADATA.items():
@@ -1040,10 +1175,33 @@ async def process_image(
         if not base_url.endswith('/'):
             base_url += '/'
 
+    # Get current timestamp
+    from datetime import datetime
+    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     response = CombinedResponse(
         image_id=image_id,
-        detected_image_url=f"{base_url}image/{vis_filename}" if os.path.exists(vis_path) else None,
-        detected_image_filename=vis_filename if os.path.exists(vis_path) else None,
+        timestamp=current_timestamp,  # Add timestamp to response
+        detected_image_url=f"{base_url}image/{vis_filename}" if 'vis_path' in locals() and os.path.exists(vis_path) else None,
+        detected_image_filename=vis_filename if 'vis_path' in locals() and os.path.exists(vis_path) else None,
+        detections=detections
+    )
+
+    # Set up base URL for response
+    base_url = str(request.base_url).rstrip('/')
+    if not base_url.endswith('/'):
+        base_url += '/'
+    if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
+        base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
+        if not base_url.endswith('/'):
+            base_url += '/'
+
+    # Create initial response
+    response = CombinedResponse(
+        image_id=image_id,
+        timestamp=current_timestamp,
+        detected_image_url=f"{base_url}image/{vis_filename}" if 'vis_path' in locals() and os.path.exists(vis_path) else None,
+        detected_image_filename=vis_filename if 'vis_path' in locals() and os.path.exists(vis_path) else None,
         detections=detections
     )
 
@@ -1051,18 +1209,51 @@ async def process_image(
         # Get existing suggestions from metadata
         existing_suggestions = []
         if image_id in IMAGE_METADATA:
-            existing_suggestions = [BackgroundSuggestion(**s) for s in IMAGE_METADATA[image_id].get('background_suggestions', [])]
-            print(f"Found {len(existing_suggestions)} existing suggestions")
+            existing_suggestions = IMAGE_METADATA[image_id].get('background_suggestions', [])
+        existing_objs = [BackgroundSuggestion(**s) for s in existing_suggestions]
         
-        # Generate new suggestions and combine with existing
-        suggestions = generate_background_suggestions(image_path=str(upload_path), existing_suggestions=existing_suggestions)
+        # Add user-provided suggestions
+        if user_suggestions:
+            existing_objs.extend(user_suggestions)
+
+        print(f"Found {len(existing_objs)} existing suggestions")
+
+        # Get ALL existing suggestions from ALL previous uploads
+        all_existing_suggestions = []
+        for meta_id, meta_data in IMAGE_METADATA.items():
+            if meta_id != image_id and 'background_suggestions' in meta_data:  # Don't include current image's suggestions
+                for s in meta_data['background_suggestions']:
+                    all_existing_suggestions.append(BackgroundSuggestion(**s))
         
-        # Store updated suggestions in metadata
-        if image_id in IMAGE_METADATA:
-            IMAGE_METADATA[image_id]['background_suggestions'] = [s.dict() for s in suggestions]
+        # Add all existing suggestions to our current ones
+        existing_objs.extend(all_existing_suggestions)
         
-        response.background_suggestions = suggestions
-        print(f"Generated background suggestions: {[s.name for s in suggestions]}")
+        # Generate new suggestions
+        if 'upload_path' in locals() and os.path.exists(str(upload_path)):
+            new_suggestions = generate_background_suggestions(image_path=str(upload_path), existing_suggestions=existing_objs)
+        else:
+            # If no upload path (e.g., when only coordinates are provided), use fallback
+            new_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") 
+                             for bg in random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))]
+
+        # Combine all suggestions
+        combined_suggestions = list(existing_objs) + list(new_suggestions)
+        
+        # Deduplicate and limit to latest 10
+        unique_keys = set()
+        final_suggestions = []
+        for s in reversed(combined_suggestions):  # Prioritize recent ones
+            key = s.name.strip().lower()
+            if key not in unique_keys:
+                final_suggestions.insert(0, s)  # Maintain order
+                unique_keys.add(key)
+            if len(final_suggestions) == 10:  # Increased limit
+                break
+
+        # Save suggestions to metadata and response
+        IMAGE_METADATA[image_id]['background_suggestions'] = [s.dict() for s in final_suggestions]
+        response.background_suggestions = final_suggestions
+        print(f"Generated background suggestions: {[s.name for s in final_suggestions]}")
     except Exception as e:
         print(f"Error generating background suggestions in process_image: {e}")
         fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
@@ -1168,3 +1359,239 @@ async def process_image(
                 print(f"Error applying background or text: {e}")
 
     return response
+
+# @app.get("/suggestions/{image_id}")
+# def get_suggestions(image_id: str):
+#     # Get suggestions for the specific image
+#     suggestions = IMAGE_METADATA.get(image_id, {}).get("background_suggestions", [])
+    
+#     # Get ALL suggestions from ALL images
+#     all_suggestions = []
+#     for meta_id, meta_data in IMAGE_METADATA.items():
+#         if 'background_suggestions' in meta_data:
+#             for s in meta_data['background_suggestions']:
+#                 all_suggestions.append(s)
+    
+#     # Return both the specific image suggestions and all suggestions
+#     return {
+#         "image_id": image_id, 
+#         "background_suggestions": suggestions,
+#         "all_suggestions": all_suggestions,
+#         # "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#     }
+
+@app.post("/minimal", response_model=CombinedResponse)
+async def minimal_response(
+    request: Request,
+    custom_suggestions: Optional[str] = Form(default=None),
+    image_id: Optional[str] = Form(default=None)
+):
+    """Minimal endpoint that only uses image_id and custom_suggestions.
+    Returns a response with timestamp and suggestions."""
+    from datetime import datetime
+    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Set up base URL for response
+    base_url = str(request.base_url).rstrip('/')
+    if not base_url.endswith('/'):
+        base_url += '/'
+    if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
+        base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
+        if not base_url.endswith('/'):
+            base_url += '/'
+    
+    # Parse user-provided suggestions
+    user_suggestions = []
+    if custom_suggestions and custom_suggestions.strip():
+        try:
+            parsed = json.loads(custom_suggestions)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "name" in item and "description" in item:
+                        user_suggestions.append(BackgroundSuggestion(name=item["name"], description=item["description"]))
+                print(f"Parsed {len(user_suggestions)} custom suggestions")
+            else:
+                print(f"Custom suggestions not in expected list format: {parsed}")
+        except Exception as e:
+            print(f"Failed to parse custom_suggestions: {e}")
+    else:
+        print("No custom suggestions provided or empty string")
+    
+    # If image_id is provided, try to use it
+    if image_id:
+        if image_id in IMAGE_METADATA:
+            print(f"Using provided image_id in minimal endpoint: {image_id}")
+        else:
+            # Image ID was provided but not found - create it instead of error
+            print(f"Image ID {image_id} not found, creating it")
+            
+            # Initialize metadata for this image
+            IMAGE_METADATA[image_id] = {
+                "path": "",
+                "detections": [],
+                "height": 0,
+                "width": 0,
+                "background_suggestions": [],
+                "timestamp": current_timestamp
+            }
+    else:
+        # No image ID provided, create a new one
+        image_id = str(uuid.uuid4())
+        print(f"Created new image ID: {image_id}")
+        
+        # Initialize metadata for this image
+        IMAGE_METADATA[image_id] = {
+            "path": "",
+            "detections": [],
+            "height": 0,
+            "width": 0,
+            "background_suggestions": [],
+            "timestamp": current_timestamp
+        }
+    
+    # If we have user-provided suggestions, add them to the image
+    if user_suggestions:
+        # Convert to dict format for storage
+        suggestion_dicts = [{"name": s.name, "description": s.description} for s in user_suggestions]
+        
+        # Initialize background_suggestions if it doesn't exist
+        if 'background_suggestions' not in IMAGE_METADATA[image_id]:
+            IMAGE_METADATA[image_id]['background_suggestions'] = []
+            
+        # Add the new suggestions
+        IMAGE_METADATA[image_id]['background_suggestions'].extend(suggestion_dicts)
+        print(f"Added {len(suggestion_dicts)} user suggestions to image {image_id}")
+    
+    # Get all suggestions for this image
+    all_suggestions = []
+    if 'background_suggestions' in IMAGE_METADATA[image_id]:
+        for s in IMAGE_METADATA[image_id]['background_suggestions']:
+            try:
+                all_suggestions.append(BackgroundSuggestion(name=s["name"], description=s["description"]))
+            except (KeyError, TypeError) as e:
+                print(f"Error processing suggestion: {e}")
+    
+    # If no suggestions exist for this image, generate some default ones
+    if not all_suggestions:
+        print(f"No suggestions found for image {image_id}, generating defaults")
+        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        default_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
+        
+        # Add these defaults to the image metadata
+        suggestion_dicts = [{"name": s.name, "description": s.description} for s in default_suggestions]
+        IMAGE_METADATA[image_id]['background_suggestions'] = suggestion_dicts
+        
+        # Use these as our suggestions
+        all_suggestions = default_suggestions
+    
+    # No background image generation in minimal endpoint
+    # Define empty variables for the response
+    background_image_url = None
+    background_image_filename = None
+    
+    # Create response with all the suggestions
+    response = CombinedResponse(
+        image_id=image_id,
+        timestamp=current_timestamp,
+        detected_image_url="",
+        detections=[],
+        background_suggestions=all_suggestions,
+        background_image_url=background_image_url,
+        background_image_filename=background_image_filename
+    )
+    
+    print(f"Returning {len(all_suggestions)} suggestions and background image URL for image {image_id}")
+    return response
+    
+    # If no image_id provided or it doesn't exist, create a new one
+    # Generate new default suggestions for this refresh
+    fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+    new_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
+    
+    # Start with user suggestions if any
+    suggestions = list(user_suggestions) if user_suggestions else []
+    
+    # Add the new suggestions we just generated
+    suggestions.extend(new_suggestions)
+    
+    # Create a new unique ID for this response
+    response_id = str(uuid.uuid4())
+    
+    # Store these suggestions in the metadata so they persist
+    IMAGE_METADATA[response_id] = {
+        "path": "",
+        "detections": [],
+        "height": 0,
+        "width": 0,
+        "background_suggestions": [{"name": s.name, "description": s.description} for s in suggestions],
+        "timestamp": current_timestamp
+    }
+    
+    # Create minimal response with timestamp and suggestions
+    minimal_response = CombinedResponse(
+        image_id=response_id,
+        timestamp=current_timestamp,
+        detected_image_url="",
+        detections=[],
+        background_suggestions=suggestions
+    )
+    
+    print(f"Created new image {response_id} with {len(suggestions)} suggestions")
+    return minimal_response
+
+@app.post("/add_suggestions")
+async def add_suggestions(
+    image_id: str = Form(...),  # Required parameter
+    suggestions: str = Form(...) # Required parameter - JSON string of suggestions
+):
+    """Minimal endpoint to add user suggestions to an existing image by its ID.
+    
+    Args:
+        image_id: The ID of the image to add suggestions to
+        suggestions: JSON string of suggestions in format [{"name": "...", "description": "..."}]
+    
+    Returns:
+        Simple success message with the number of suggestions added
+    """
+    # Check if image_id exists
+    if image_id not in IMAGE_METADATA:
+        raise HTTPException(status_code=404, detail=f"Image with ID {image_id} not found")
+    
+    # Parse user-provided suggestions
+    user_suggestions = []
+    if suggestions and suggestions.strip():
+        try:
+            parsed = json.loads(suggestions)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "name" in item and "description" in item:
+                        user_suggestions.append({"name": item["name"], "description": item["description"]})
+            else:
+                # If not a list, try to create a single suggestion
+                if isinstance(parsed, dict) and "name" in parsed and "description" in parsed:
+                    user_suggestions.append({"name": parsed["name"], "description": parsed["description"]})
+        except Exception as e:
+            # Instead of error, provide default suggestions
+            print(f"Failed to parse suggestions: {e}, using defaults")
+            fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+            user_suggestions = [{"name": bg, "description": f"A {bg} background"} for bg in fallback_suggestions]
+    else:
+        # If no suggestions provided, use defaults
+        print("No suggestions provided, using defaults")
+        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        user_suggestions = [{"name": bg, "description": f"A {bg} background"} for bg in fallback_suggestions]
+    
+    # Simply append the new suggestions to the image metadata
+    if 'background_suggestions' not in IMAGE_METADATA[image_id]:
+        IMAGE_METADATA[image_id]['background_suggestions'] = []
+    
+    # Add the new suggestions
+    IMAGE_METADATA[image_id]['background_suggestions'].extend(user_suggestions)
+    
+    # Return a simple success message
+    return {
+        "success": True,
+        "image_id": image_id,
+        "suggestions_added": len(user_suggestions),
+        "total_suggestions": len(IMAGE_METADATA[image_id]['background_suggestions'])
+    }
