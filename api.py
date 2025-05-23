@@ -1380,7 +1380,7 @@ async def process_image(
 #         # "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 #     }
 
-@app.post("/minimal", response_model=CombinedResponse)
+# @app.post("/minimal", response_model=CombinedResponse)
 async def minimal_response(
     request: Request,
     custom_suggestions: Optional[str] = Form(default=None),
