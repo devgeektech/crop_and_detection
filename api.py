@@ -1541,21 +1541,33 @@ async def minimal_response(
 
 @app.post("/add_suggestions")
 async def add_suggestions(
+    request: Request,
     image_id: str = Form(...),  # Required parameter
     suggestions: str = Form(...) # Required parameter - JSON string of suggestions
 ):
-    """Minimal endpoint to add user suggestions to an existing image by its ID.
+    """Endpoint to add user suggestions to an existing image by its ID and generate OpenAI image URLs for each suggestion.
     
     Args:
+        request: The FastAPI request object to build URLs
         image_id: The ID of the image to add suggestions to
         suggestions: JSON string of suggestions in format [{"name": "...", "description": "..."}]
     
     Returns:
-        Simple success message with the number of suggestions added
+        Success message with the number of suggestions added, OpenAI generated image URLs for each suggestion,
+        and the URL of the cropped image associated with the image_id
     """
-    # Check if image_id exists
+    # Check if image_id exists, if not create a new entry in the metadata
     if image_id not in IMAGE_METADATA:
-        raise HTTPException(status_code=404, detail=f"Image with ID {image_id} not found")
+        print(f"Creating new entry for image ID: {image_id}")
+        # Create a minimal entry for this image ID
+        IMAGE_METADATA[image_id] = {
+            "path": "",
+            "detections": [],
+            "height": 0,
+            "width": 0,
+            "background_suggestions": [],
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
     
     # Parse user-provided suggestions
     user_suggestions = []
@@ -1581,17 +1593,165 @@ async def add_suggestions(
         fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
         user_suggestions = [{"name": bg, "description": f"A {bg} background"} for bg in fallback_suggestions]
     
-    # Simply append the new suggestions to the image metadata
+    # Set up base URL for response
+    base_url = str(request.base_url).rstrip('/')
+    if not base_url.endswith('/'):
+        base_url += '/'
+    if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
+        base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
+        if not base_url.endswith('/'):
+            base_url += '/'
+    
+    # Get the cropped image URL if it exists
+    cropped_image_url = None
+    clean_image_url = None
+    extracted_image_url = None
+    
+    # Find the cropped image files associated with this image_id
+    metadata = IMAGE_METADATA[image_id]
+    detections = metadata.get("detections", [])
+    
+    # Default object_id to use in filenames
+    object_id = "0"
+    
+    if detections:
+        # Use the first detection as default if available
+        object_id = detections[0].get("id", "0") if isinstance(detections[0], dict) else "0"
+    
+    # Check for clean image (without boundary)
+    clean_filename = f"{image_id}_{object_id}_clean.png"
+    clean_path = OUTPUT_DIR / clean_filename
+    if os.path.exists(clean_path):
+        clean_image_url = f"{base_url}image/{clean_filename}"
+    
+    # Check for extracted image (with boundary)
+    extracted_filename = f"{image_id}_{object_id}_extracted.png"
+    extracted_path = OUTPUT_DIR / extracted_filename
+    if os.path.exists(extracted_path):
+        extracted_image_url = f"{base_url}image/{extracted_filename}"
+    
+    # Use either one as the cropped image URL
+    cropped_image_url = clean_image_url or extracted_image_url
+    
+    # If no cropped image URL is found, check for any image with this image_id as a prefix
+    if not cropped_image_url:
+        # Try to find any image file that starts with this image_id
+        possible_files = list(OUTPUT_DIR.glob(f"{image_id}*.*"))
+        if possible_files:
+            # Use the first matching file
+            filename = possible_files[0].name
+            cropped_image_url = f"{base_url}image/{filename}"
+    
+    # Generate OpenAI image URLs for each suggestion
+    suggestions_with_images = []
+    
+    for suggestion in user_suggestions:
+        try:
+            # Create a prompt for the image generation
+            prompt = f"A high-quality background image of {suggestion['description']}"
+            print(f"Generating image for prompt: {prompt}")
+            
+            # Generate image with DALL-E
+            response = aiml_client.images.generate(
+                model="dall-e-2",  # Using DALL-E 2 for compatibility
+                prompt=prompt,
+                size="1024x1024",
+                quality="standard",
+                n=1,
+            )
+            
+            # Get the image URL
+            background_image_url = response.data[0].url
+            
+            # Create a combined image if we have a cropped image
+            combined_image_url = None
+            if cropped_image_url:
+                try:
+                    # Download the background image
+                    import requests
+                    from io import BytesIO
+                    
+                    # Download the background image from OpenAI
+                    bg_response = requests.get(background_image_url)
+                    if bg_response.status_code == 200:
+                        # Create a background PIL Image
+                        background_img = Image.open(BytesIO(bg_response.content))
+                        
+                        # Get the cropped image path
+                        if clean_image_url:
+                            # Use clean image (no boundary) if available
+                            cropped_path = clean_path
+                        elif extracted_image_url:
+                            # Use extracted image (with boundary) if available
+                            cropped_path = extracted_path
+                        else:
+                            # Try to find any image with this image_id prefix
+                            possible_files = list(OUTPUT_DIR.glob(f"{image_id}*.*"))
+                            if possible_files:
+                                cropped_path = possible_files[0]
+                            else:
+                                cropped_path = None
+                        
+                        if cropped_path and os.path.exists(cropped_path):
+                            # Open the cropped image
+                            cropped_img = Image.open(cropped_path)
+                            
+                            # Combine the images
+                            position = "center"  # Default position
+                            scale = 1.0  # Default scale
+                            combined_img = combine_with_background(cropped_img, background_img, position=position, scale=scale)
+                            
+                            # Save the combined image
+                            combined_filename = f"{image_id}_{suggestion['name'].replace(' ', '_')}_combined.png"
+                            combined_path = OUTPUT_DIR / combined_filename
+                            combined_img.save(combined_path)
+                            
+                            # Create URL for the combined image
+                            combined_image_url = f"{base_url}image/{combined_filename}"
+                            print(f"Created combined image at {combined_path}")
+                except Exception as e:
+                    print(f"Error creating combined image: {e}")
+            
+            # Add the image URLs to the suggestion
+            suggestion_with_image = {
+                "name": suggestion["name"],
+                "description": suggestion["description"],
+                "image_id": image_id,
+                "background_image_url": background_image_url,
+                "cropped_image_url": cropped_image_url,
+                "combined_image_url": combined_image_url  # Add the combined image URL
+            }
+            
+            suggestions_with_images.append(suggestion_with_image)
+            print(f"Generated image URL for '{suggestion['name']}': {image_url}")
+            
+        except Exception as e:
+            print(f"Error generating image for suggestion '{suggestion['name']}': {e}")
+            # Add the suggestion without an image URL but with the cropped image URL
+            suggestion_with_image = {
+                "name": suggestion["name"],
+                "description": suggestion["description"],
+                "image_id": image_id,
+                "background_image_url": None,  # No background image URL available
+                "cropped_image_url": cropped_image_url,
+                "combined_image_url": None  # No combined image URL available
+            }
+            suggestions_with_images.append(suggestion_with_image)
+    
+    # Store the suggestions with image URLs in the image metadata
     if 'background_suggestions' not in IMAGE_METADATA[image_id]:
         IMAGE_METADATA[image_id]['background_suggestions'] = []
     
-    # Add the new suggestions
-    IMAGE_METADATA[image_id]['background_suggestions'].extend(user_suggestions)
+    # Add the new suggestions with image URLs
+    IMAGE_METADATA[image_id]['background_suggestions'].extend(suggestions_with_images)
     
-    # Return a simple success message
     return {
         "success": True,
         "image_id": image_id,
-        "suggestions_added": len(user_suggestions),
-        "total_suggestions": len(IMAGE_METADATA[image_id]['background_suggestions'])
+        "cropped_image_url": cropped_image_url,  
+        "clean_image_url": clean_image_url,     
+        "extracted_image_url": extracted_image_url, 
+        "suggestions_added": len(suggestions_with_images),
+        "total_suggestions": len(IMAGE_METADATA[image_id]['background_suggestions']),
+        "suggestions": suggestions_with_images
     }
