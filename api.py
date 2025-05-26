@@ -2,7 +2,8 @@ import os
 import cv2
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageDraw
+from PIL import Image
+from PIL import ImageDraw
 from rembg import remove
 from fastapi import FastAPI, Request, File, UploadFile, HTTPException, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -14,7 +15,7 @@ import uuid
 import json
 import random
 from pathlib import Path
-from openai import OpenAI
+from openai import OpenAI   
 from dotenv import load_dotenv
 from pydantic import ValidationError
 from datetime import datetime
@@ -1360,192 +1361,15 @@ async def process_image(
 
     return response
 
-# @app.get("/suggestions/{image_id}")
-# def get_suggestions(image_id: str):
-#     # Get suggestions for the specific image
-#     suggestions = IMAGE_METADATA.get(image_id, {}).get("background_suggestions", [])
-    
-#     # Get ALL suggestions from ALL images
-#     all_suggestions = []
-#     for meta_id, meta_data in IMAGE_METADATA.items():
-#         if 'background_suggestions' in meta_data:
-#             for s in meta_data['background_suggestions']:
-#                 all_suggestions.append(s)
-    
-#     # Return both the specific image suggestions and all suggestions
-#     return {
-#         "image_id": image_id, 
-#         "background_suggestions": suggestions,
-#         "all_suggestions": all_suggestions,
-#         # "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#     }
-
-# @app.post("/minimal", response_model=CombinedResponse)
-async def minimal_response(
-    request: Request,
-    custom_suggestions: Optional[str] = Form(default=None),
-    image_id: Optional[str] = Form(default=None)
-):
-    """Minimal endpoint that only uses image_id and custom_suggestions.
-    Returns a response with timestamp and suggestions."""
-    from datetime import datetime
-    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Set up base URL for response
-    base_url = str(request.base_url).rstrip('/')
-    if not base_url.endswith('/'):
-        base_url += '/'
-    if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
-        base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
-        if not base_url.endswith('/'):
-            base_url += '/'
-    
-    # Parse user-provided suggestions
-    user_suggestions = []
-    if custom_suggestions and custom_suggestions.strip():
-        try:
-            parsed = json.loads(custom_suggestions)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and "name" in item and "description" in item:
-                        user_suggestions.append(BackgroundSuggestion(name=item["name"], description=item["description"]))
-                print(f"Parsed {len(user_suggestions)} custom suggestions")
-            else:
-                print(f"Custom suggestions not in expected list format: {parsed}")
-        except Exception as e:
-            print(f"Failed to parse custom_suggestions: {e}")
-    else:
-        print("No custom suggestions provided or empty string")
-    
-    # If image_id is provided, try to use it
-    if image_id:
-        if image_id in IMAGE_METADATA:
-            print(f"Using provided image_id in minimal endpoint: {image_id}")
-        else:
-            # Image ID was provided but not found - create it instead of error
-            print(f"Image ID {image_id} not found, creating it")
-            
-            # Initialize metadata for this image
-            IMAGE_METADATA[image_id] = {
-                "path": "",
-                "detections": [],
-                "height": 0,
-                "width": 0,
-                "background_suggestions": [],
-                "timestamp": current_timestamp
-            }
-    else:
-        # No image ID provided, create a new one
-        image_id = str(uuid.uuid4())
-        print(f"Created new image ID: {image_id}")
-        
-        # Initialize metadata for this image
-        IMAGE_METADATA[image_id] = {
-            "path": "",
-            "detections": [],
-            "height": 0,
-            "width": 0,
-            "background_suggestions": [],
-            "timestamp": current_timestamp
-        }
-    
-    # If we have user-provided suggestions, add them to the image
-    if user_suggestions:
-        # Convert to dict format for storage
-        suggestion_dicts = [{"name": s.name, "description": s.description} for s in user_suggestions]
-        
-        # Initialize background_suggestions if it doesn't exist
-        if 'background_suggestions' not in IMAGE_METADATA[image_id]:
-            IMAGE_METADATA[image_id]['background_suggestions'] = []
-            
-        # Add the new suggestions
-        IMAGE_METADATA[image_id]['background_suggestions'].extend(suggestion_dicts)
-        print(f"Added {len(suggestion_dicts)} user suggestions to image {image_id}")
-    
-    # Get all suggestions for this image
-    all_suggestions = []
-    if 'background_suggestions' in IMAGE_METADATA[image_id]:
-        for s in IMAGE_METADATA[image_id]['background_suggestions']:
-            try:
-                all_suggestions.append(BackgroundSuggestion(name=s["name"], description=s["description"]))
-            except (KeyError, TypeError) as e:
-                print(f"Error processing suggestion: {e}")
-    
-    # If no suggestions exist for this image, generate some default ones
-    if not all_suggestions:
-        print(f"No suggestions found for image {image_id}, generating defaults")
-        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
-        default_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
-        
-        # Add these defaults to the image metadata
-        suggestion_dicts = [{"name": s.name, "description": s.description} for s in default_suggestions]
-        IMAGE_METADATA[image_id]['background_suggestions'] = suggestion_dicts
-        
-        # Use these as our suggestions
-        all_suggestions = default_suggestions
-    
-    # No background image generation in minimal endpoint
-    # Define empty variables for the response
-    background_image_url = None
-    background_image_filename = None
-    
-    # Create response with all the suggestions
-    response = CombinedResponse(
-        image_id=image_id,
-        timestamp=current_timestamp,
-        detected_image_url="",
-        detections=[],
-        background_suggestions=all_suggestions,
-        background_image_url=background_image_url,
-        background_image_filename=background_image_filename
-    )
-    
-    print(f"Returning {len(all_suggestions)} suggestions and background image URL for image {image_id}")
-    return response
-    
-    # If no image_id provided or it doesn't exist, create a new one
-    # Generate new default suggestions for this refresh
-    fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
-    new_suggestions = [BackgroundSuggestion(name=bg, description=f"A {bg} background") for bg in fallback_suggestions]
-    
-    # Start with user suggestions if any
-    suggestions = list(user_suggestions) if user_suggestions else []
-    
-    # Add the new suggestions we just generated
-    suggestions.extend(new_suggestions)
-    
-    # Create a new unique ID for this response
-    response_id = str(uuid.uuid4())
-    
-    # Store these suggestions in the metadata so they persist
-    IMAGE_METADATA[response_id] = {
-        "path": "",
-        "detections": [],
-        "height": 0,
-        "width": 0,
-        "background_suggestions": [{"name": s.name, "description": s.description} for s in suggestions],
-        "timestamp": current_timestamp
-    }
-    
-    # Create minimal response with timestamp and suggestions
-    minimal_response = CombinedResponse(
-        image_id=response_id,
-        timestamp=current_timestamp,
-        detected_image_url="",
-        detections=[],
-        background_suggestions=suggestions
-    )
-    
-    print(f"Created new image {response_id} with {len(suggestions)} suggestions")
-    return minimal_response
+# Removed unused endpoints to optimize the API
 
 @app.post("/add_suggestions")
 async def add_suggestions(
     request: Request,
     image_id: str = Form(...),  # Required parameter
-    suggestions: str = Form(...) # Required parameter - JSON string of suggestions
+    suggestions: str = Form(...)  # Required parameter - JSON string of suggestions
 ):
-    """Endpoint to add user suggestions to an existing image by its ID and generate OpenAI image URLs for each suggestion.
+    """Optimized endpoint to add background suggestions to an image and generate background images.
     
     Args:
         request: The FastAPI request object to build URLs
@@ -1553,205 +1377,164 @@ async def add_suggestions(
         suggestions: JSON string of suggestions in format [{"name": "...", "description": "..."}]
     
     Returns:
-        Success message with the number of suggestions added, OpenAI generated image URLs for each suggestion,
-        and the URL of the cropped image associated with the image_id
+        Success message with the number of suggestions added and generated images
     """
-    # Check if image_id exists, if not create a new entry in the metadata
+    # Ensure the image_id exists in metadata
     if image_id not in IMAGE_METADATA:
-        print(f"Creating new entry for image ID: {image_id}")
-        # Create a minimal entry for this image ID
         IMAGE_METADATA[image_id] = {
             "path": "",
             "detections": [],
             "height": 0,
             "width": 0,
             "background_suggestions": [],
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": datetime.now().isoformat()
         }
     
     # Parse user-provided suggestions
     user_suggestions = []
-    if suggestions and suggestions.strip():
-        try:
+    try:
+        # Try to parse JSON suggestions
+        if suggestions and suggestions.strip():
             parsed = json.loads(suggestions)
             if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and "name" in item and "description" in item:
-                        user_suggestions.append({"name": item["name"], "description": item["description"]})
-            else:
-                # If not a list, try to create a single suggestion
-                if isinstance(parsed, dict) and "name" in parsed and "description" in parsed:
-                    user_suggestions.append({"name": parsed["name"], "description": parsed["description"]})
-        except Exception as e:
-            # Instead of error, provide default suggestions
-            print(f"Failed to parse suggestions: {e}, using defaults")
-            fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
-            user_suggestions = [{"name": bg, "description": f"A {bg} background"} for bg in fallback_suggestions]
-    else:
-        # If no suggestions provided, use defaults
-        print("No suggestions provided, using defaults")
-        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
-        user_suggestions = [{"name": bg, "description": f"A {bg} background"} for bg in fallback_suggestions]
+                user_suggestions = [
+                    {"name": item["name"], "description": item["description"]}
+                    for item in parsed if isinstance(item, dict) and "name" in item and "description" in item
+                ]
+            elif isinstance(parsed, dict) and "name" in parsed and "description" in parsed:
+                user_suggestions = [{"name": parsed["name"], "description": parsed["description"]}]
+    except Exception as e:
+        print(f"Error parsing suggestions: {e}")
+    
+    # If no valid suggestions provided, use defaults
+    if not user_suggestions:
+        user_suggestions = [
+            {"name": bg, "description": f"A {bg} background"}
+            for bg in random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        ]
     
     # Set up base URL for response
     base_url = str(request.base_url).rstrip('/')
     if not base_url.endswith('/'):
         base_url += '/'
-    if os.environ.get("RENDER", "") == "true" and os.environ.get("RENDER_EXTERNAL_URL"):
-        base_url = os.environ.get("RENDER_EXTERNAL_URL").rstrip('/')
-        if not base_url.endswith('/'):
-            base_url += '/'
     
-    # Get the cropped image URL if it exists
-    cropped_image_url = None
-    clean_image_url = None
-    extracted_image_url = None
+    # Find relevant image files
+    image_files = {}
     
-    # Find the cropped image files associated with this image_id
-    metadata = IMAGE_METADATA[image_id]
-    detections = metadata.get("detections", [])
-    
-    # Default object_id to use in filenames
+    # Find the first detection object_id
     object_id = "0"
+    if IMAGE_METADATA[image_id].get("detections"):
+        detection = IMAGE_METADATA[image_id]["detections"][0]
+        object_id = detection.get("id", "0") if isinstance(detection, dict) else "0"
     
-    if detections:
-        # Use the first detection as default if available
-        object_id = detections[0].get("id", "0") if isinstance(detections[0], dict) else "0"
+    # Check for various image types
+    file_types = {
+        "clean": f"{image_id}_{object_id}_clean.png",
+        "extracted": f"{image_id}_{object_id}_extracted.png",
+        "detected": f"{image_id}_detected.png"
+    }
     
-    # Check for clean image (without boundary)
-    clean_filename = f"{image_id}_{object_id}_clean.png"
-    clean_path = OUTPUT_DIR / clean_filename
-    if os.path.exists(clean_path):
-        clean_image_url = f"{base_url}image/{clean_filename}"
+    for type_name, filename in file_types.items():
+        path = OUTPUT_DIR / filename
+        if path.exists():
+            image_files[type_name] = {
+                "path": path,
+                "url": f"{base_url}image/{filename}"
+            }
     
-    # Check for extracted image (with boundary)
-    extracted_filename = f"{image_id}_{object_id}_extracted.png"
-    extracted_path = OUTPUT_DIR / extracted_filename
-    if os.path.exists(extracted_path):
-        extracted_image_url = f"{base_url}image/{extracted_filename}"
-    
-    # Use either one as the cropped image URL
-    cropped_image_url = clean_image_url or extracted_image_url
-    
-    # If no cropped image URL is found, check for any image with this image_id as a prefix
-    if not cropped_image_url:
-        # Try to find any image file that starts with this image_id
+    # If no specific files found, look for any with this image_id
+    if not image_files:
         possible_files = list(OUTPUT_DIR.glob(f"{image_id}*.*"))
         if possible_files:
-            # Use the first matching file
-            filename = possible_files[0].name
-            cropped_image_url = f"{base_url}image/{filename}"
+            path = possible_files[0]
+            image_files["generic"] = {
+                "path": path,
+                "url": f"{base_url}image/{path.name}"
+            }
     
-    # Generate OpenAI image URLs for each suggestion
-    suggestions_with_images = []
+    # Get the best image to use for combinations
+    source_image = None
+    source_image_url = None
+    for type_name in ["clean", "extracted", "generic", "detected"]:
+        if type_name in image_files:
+            source_image = image_files[type_name]["path"]
+            source_image_url = image_files[type_name]["url"]
+            break
+    
+    # Process each suggestion
+    processed_suggestions = []
     
     for suggestion in user_suggestions:
         try:
-            # Create a prompt for the image generation
-            prompt = f"A high-quality background image of {suggestion['description']}"
-            print(f"Generating image for prompt: {prompt}")
-            
-            # Generate image with DALL-E
-            response = aiml_client.images.generate(
-                model="dall-e-2",  # Using DALL-E 2 for compatibility
-                prompt=prompt,
-                size="1024x1024",
-                quality="standard",
-                n=1,
-            )
-            
-            # Get the image URL
-            background_image_url = response.data[0].url
-            
-            # Create a combined image if we have a cropped image
-            combined_image_url = None
-            if cropped_image_url:
-                try:
-                    # Download the background image
-                    import requests
-                    from io import BytesIO
-                    
-                    # Download the background image from OpenAI
-                    bg_response = requests.get(background_image_url)
-                    if bg_response.status_code == 200:
-                        # Create a background PIL Image
-                        background_img = Image.open(BytesIO(bg_response.content))
-                        
-                        # Get the cropped image path
-                        if clean_image_url:
-                            # Use clean image (no boundary) if available
-                            cropped_path = clean_path
-                        elif extracted_image_url:
-                            # Use extracted image (with boundary) if available
-                            cropped_path = extracted_path
-                        else:
-                            # Try to find any image with this image_id prefix
-                            possible_files = list(OUTPUT_DIR.glob(f"{image_id}*.*"))
-                            if possible_files:
-                                cropped_path = possible_files[0]
-                            else:
-                                cropped_path = None
-                        
-                        if cropped_path and os.path.exists(cropped_path):
-                            # Open the cropped image
-                            cropped_img = Image.open(cropped_path)
-                            
-                            # Combine the images
-                            position = "center"  # Default position
-                            scale = 1.0  # Default scale
-                            combined_img = combine_with_background(cropped_img, background_img, position=position, scale=scale)
-                            
-                            # Save the combined image
-                            combined_filename = f"{image_id}_{suggestion['name'].replace(' ', '_')}_combined.png"
-                            combined_path = OUTPUT_DIR / combined_filename
-                            combined_img.save(combined_path)
-                            
-                            # Create URL for the combined image
-                            combined_image_url = f"{base_url}image/{combined_filename}"
-                            print(f"Created combined image at {combined_path}")
-                except Exception as e:
-                    print(f"Error creating combined image: {e}")
-            
-            # Add the image URLs to the suggestion
-            suggestion_with_image = {
+            result = {
                 "name": suggestion["name"],
                 "description": suggestion["description"],
                 "image_id": image_id,
-                "background_image_url": background_image_url,
-                "cropped_image_url": cropped_image_url,
-                "combined_image_url": combined_image_url  # Add the combined image URL
+                "source_image_url": source_image_url
             }
             
-            suggestions_with_images.append(suggestion_with_image)
-            print(f"Generated image URL for '{suggestion['name']}': {image_url}")
+            # Generate background image with DALL-E if API key is available
+            if aiml_api_key:
+                try:
+                    prompt = f"A high-quality background image of {suggestion['description']}"
+                    response = aiml_client.images.generate(
+                        model="dall-e-2",
+                        prompt=prompt,
+                        size="1024x1024",
+                        quality="standard",
+                        n=1,
+                    )
+                    
+                    result["background_image_url"] = response.data[0].url
+                    
+                    # Create combined image if we have a source image
+                    if source_image and os.path.exists(source_image):
+                        try:
+                            import requests
+                            from io import BytesIO
+                            
+                            # Download the background image
+                            bg_response = requests.get(result["background_image_url"])
+                            if bg_response.status_code == 200:
+                                # Create the combined image
+                                background_img = Image.open(BytesIO(bg_response.content))
+                                foreground_img = Image.open(source_image)
+                                
+                                combined_img = combine_with_background(
+                                    foreground_img, 
+                                    background_img, 
+                                    position="center", 
+                                    scale=1.0
+                                )
+                                
+                                # Save the combined image
+                                combined_filename = f"{image_id}_{suggestion['name'].replace(' ', '_')}_combined.png"
+                                combined_path = OUTPUT_DIR / combined_filename
+                                combined_img.save(combined_path)
+                                
+                                result["combined_image_url"] = f"{base_url}image/{combined_filename}"
+                        except Exception as e:
+                            print(f"Error creating combined image: {e}")
+                except Exception as e:
+                    print(f"Error generating background with DALL-E: {e}")
+            
+            processed_suggestions.append(result)
             
         except Exception as e:
-            print(f"Error generating image for suggestion '{suggestion['name']}': {e}")
-            # Add the suggestion without an image URL but with the cropped image URL
-            suggestion_with_image = {
-                "name": suggestion["name"],
-                "description": suggestion["description"],
-                "image_id": image_id,
-                "background_image_url": None,  # No background image URL available
-                "cropped_image_url": cropped_image_url,
-                "combined_image_url": None  # No combined image URL available
-            }
-            suggestions_with_images.append(suggestion_with_image)
+            print(f"Error processing suggestion '{suggestion.get('name', 'unknown')}': {e}")
     
-    # Store the suggestions with image URLs in the image metadata
+    # Store the processed suggestions in metadata
     if 'background_suggestions' not in IMAGE_METADATA[image_id]:
         IMAGE_METADATA[image_id]['background_suggestions'] = []
     
-    # Add the new suggestions with image URLs
-    IMAGE_METADATA[image_id]['background_suggestions'].extend(suggestions_with_images)
+    # Add the new suggestions
+    IMAGE_METADATA[image_id]['background_suggestions'].extend(processed_suggestions)
     
     return {
         "success": True,
         "image_id": image_id,
-        "cropped_image_url": cropped_image_url,  
-        "clean_image_url": clean_image_url,     
-        "extracted_image_url": extracted_image_url, 
-        "suggestions_added": len(suggestions_with_images),
+        "source_image_url": source_image_url,
+        "suggestions_added": len(processed_suggestions),
         "total_suggestions": len(IMAGE_METADATA[image_id]['background_suggestions']),
-        "suggestions": suggestions_with_images
+        "suggestions": processed_suggestions
     }

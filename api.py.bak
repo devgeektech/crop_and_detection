@@ -1,0 +1,520 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+from PIL import Image, ImageDraw
+from rembg import remove
+from fastapi import FastAPI, Request, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Union
+import shutil
+import uuid
+import json
+import random
+from pathlib import Path
+from openai import OpenAI
+from dotenv import load_dotenv
+from pydantic import ValidationError
+from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
+import time
+from io import BytesIO
+import requests
+load_dotenv()
+
+UPLOAD_DIR = Path("uploads")
+OUTPUT_DIR = Path("outputs")
+PROCESSED_DIR = Path("processed")
+BACKGROUND_DIR = Path("backgrounds")
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+PROCESSED_DIR.mkdir(exist_ok=True)
+BACKGROUND_DIR.mkdir(exist_ok=True)
+aiml_api_key = os.getenv("AIML_API_KEY")
+aiml_client = OpenAI(
+    api_key=aiml_api_key,
+    base_url="https://api.aimlapi.com/v1"
+)
+
+DEFAULT_BACKGROUND_OPTIONS = [
+    "beach", "mountain", "city", "forest", "space", "sunset", "office",
+    "studio", "abstract", "gradient", "solid color", "vintage", "futuristic"
+]
+
+IMAGE_METADATA = {}
+
+app = FastAPI(title="Person Detector and Cropper API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"], 
+)
+
+COCO_LABELS = {
+    0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
+    5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
+    10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird',
+    15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow',
+    20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack',
+    25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee',
+    30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat',
+    35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle',
+    40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon',
+    45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange',
+    50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut',
+    55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed',
+    60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse',
+    65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven',
+    70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock',
+    75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
+}
+
+class DetectionResult(BaseModel):
+    id: str
+    box: List[float]
+    score: float
+    class_id: int
+    class_name: str
+    
+class SegmentationResult(BaseModel):
+    id: str
+    success: bool
+    filename: str
+    
+class ProcessedImage(BaseModel):
+    image_id: str
+    filename: str
+    detections: List[DetectionResult]
+    
+class ExtractedObject(BaseModel):
+    image_id: str
+    object_id: str
+    filename: str
+    clean_filename: Optional[str] = None  
+    full_image_filename: Optional[str] = None 
+
+def generate_background_suggestions(image_path=None, existing_suggestions=None):
+    """Generate background suggestions using OpenAI API based on the image"""
+
+    existing_suggestions = existing_suggestions or []
+
+    def suggestion_key(s):
+        # Normalize name to compare duplicates
+        return s.name.strip().lower()
+
+    try:
+        fallback_suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        fallback_result = [
+            BackgroundSuggestion(name=bg, description=f"A {bg} background") 
+            for bg in fallback_suggestions
+        ]
+
+        if not openai.api_key:
+            print("No OpenAI API key provided, using fallback background suggestions")
+            combined = existing_suggestions + fallback_result
+            # Remove duplicates based on name
+            unique = []
+            seen = set()
+            for s in combined:
+                k = suggestion_key(s)
+                if k not in seen:
+                    unique.append(s)
+                    seen.add(k)
+            print(f"Returning {len(unique[:5])} suggestions after fallback")
+            return unique[:5]
+
+        image_description = "a person's photo"
+
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as image_file:
+                    import base64
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+                try:
+                    vision_response = aiml_client.chat.completions.create(
+                        model="gpt-4-vision-preview",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Describe this image briefly, focusing on the subject, their attire, and the overall mood. Keep it under 50 words."},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                                    }
+                                ]
+                            }
+                        ],
+                        max_tokens=100
+                    )
+                    image_description = vision_response.choices[0].message.content
+                except Exception as e:
+                    print(f"Error in GPT-4 Vision API call: {e}")
+                    image_description = "a person in a photo"
+                print(f"Image description: {image_description}")
+            except Exception as e:
+                print(f"Error analyzing image: {e}")
+
+        try:
+            response = aiml_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a creative assistant that suggests unique and visually appealing background ideas for photos."},
+                    {"role": "user", "content": f"Based on this image description: '{image_description}', suggest three creative and visually appealing background ideas that would complement the subject. For each suggestion, provide a short name and a brief description that could be used to generate the background with DALL-E. Make sure each suggestion is distinct and would look good with the subject."},
+                ],
+                temperature=0.8,
+                max_tokens=200,
+            )
+        except Exception as e:
+            print(f"Error with AIML API chat completion: {e}")
+            combined = existing_suggestions + fallback_result
+            # Remove duplicates
+            unique = []
+            seen = set()
+            for s in combined:
+                k = suggestion_key(s)
+                if k not in seen:
+                    unique.append(s)
+                    seen.add(k)
+            return unique[:5]
+
+        content = response.choices[0].message.content
+        suggestions = []
+        lines = content.strip().split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith(('1.', '2.', '3.', '•', '-', '*')) or (line[0].isdigit() and line[1:3] in ('. ', ') ')):
+                # Remove leading bullet number etc
+                if ' ' in line:
+                    line = line.split(' ', 1)[1].strip()
+
+                if ':' in line:
+                    name, description = line.split(':', 1)
+                    suggestions.append(BackgroundSuggestion(name=name.strip(), description=description.strip()))
+                else:
+                    suggestions.append(BackgroundSuggestion(name=line, description=line))
+
+        if not suggestions or len(suggestions) < 3:
+            words = content.replace('.', ' ').replace(',', ' ').split()
+            potential_names = [w for w in words if len(w) > 4 and w.lower() not in ['background', 'suggest', 'creative', 'photo']]
+
+            while len(potential_names) < 3:
+                potential_names.append(random.choice(DEFAULT_BACKGROUND_OPTIONS))
+
+            suggestions = [
+                BackgroundSuggestion(name=name, description=f"A {name.lower()} background") 
+                for name in random.sample(potential_names, min(3, len(potential_names)))
+            ]
+
+        # Merge with existing suggestions - only add new unique names
+        existing_keys = {suggestion_key(s) for s in existing_suggestions}
+        new_unique_suggestions = [s for s in suggestions if suggestion_key(s) not in existing_keys]
+
+        combined = existing_suggestions + new_unique_suggestions
+
+        # Deduplicate again just in case
+        seen = set()
+        unique_combined = []
+        for s in combined:
+            k = suggestion_key(s)
+            if k not in seen:
+                unique_combined.append(s)
+                seen.add(k)
+
+        # Return last 5 suggestions (most recent)
+        print(f"Returning {len(unique_combined[-5:])} suggestions (latest 5)")
+        return unique_combined[-5:]
+
+    except Exception as e:
+        print(f"Error generating background suggestions: {e}")
+        suggestions = random.sample(DEFAULT_BACKGROUND_OPTIONS, min(3, len(DEFAULT_BACKGROUND_OPTIONS)))
+        fallback_combined = existing_suggestions + [
+            BackgroundSuggestion(name=bg, description=f"A {bg} background") 
+            for bg in suggestions
+        ]
+        # Deduplicate fallback combined
+        seen = set()
+        unique_fallback = []
+        for s in fallback_combined:
+            k = suggestion_key(s)
+            if k not in seen:
+                unique_fallback.append(s)
+                seen.add(k)
+        return unique_fallback[-5:]
+
+def combine_with_background(foreground_image, background_image, position="center", scale=1.0):
+    """Combine a foreground image (with transparency) with a background image"""
+    try:
+        # Convert to PIL Image if they're not already
+        if not isinstance(foreground_image, Image.Image):
+            foreground_image = Image.open(foreground_image)
+        if not isinstance(background_image, Image.Image):
+            background_image = Image.open(background_image)
+            
+        # Ensure foreground has alpha channel
+        if foreground_image.mode != 'RGBA':
+            foreground_image = foreground_image.convert('RGBA')
+            
+        # Convert background to RGBA
+        background = background_image.convert('RGBA')
+        
+        # Get dimensions
+        fg_width, fg_height = foreground_image.size
+        bg_width, bg_height = background.size
+        
+        # Scale foreground if needed
+        if scale != 1.0:
+            new_width = int(fg_width * scale)
+            new_height = int(fg_height * scale)
+            foreground_image = foreground_image.resize((new_width, new_height), Image.LANCZOS)
+            fg_width, fg_height = foreground_image.size
+        
+        # Calculate position to place foreground
+        if position == "center":
+            position = ((bg_width - fg_width) // 2, (bg_height - fg_height) // 2)
+        elif position == "bottom_center":
+            position = ((bg_width - fg_width) // 2, bg_height - fg_height - 10)
+        elif position == "top_center":
+            position = ((bg_width - fg_width) // 2, 10)
+        elif position == "random":
+            max_x = max(0, bg_width - fg_width)
+            max_y = max(0, bg_height - fg_height)
+            position = (random.randint(0, max_x), random.randint(0, max_y))
+        elif isinstance(position, tuple) and len(position) == 2:
+            # Use provided position tuple
+            position = position
+        else:
+            # Default to center if position is not recognized
+            position = ((bg_width - fg_width) // 2, (bg_height - fg_height) // 2)
+        
+        # Create a new composite image
+        composite = Image.new('RGBA', background.size, (0, 0, 0, 0))
+        composite.paste(background, (0, 0))
+        composite.paste(foreground_image, position, foreground_image)
+        
+        # Convert back to RGB for saving
+        return composite.convert('RGB')
+        
+    except Exception as e:
+        print(f"Error combining images: {e}")
+        # Return the background image if there's an error
+        if isinstance(background_image, Image.Image):
+            return background_image.convert('RGB') if background_image.mode == 'RGBA' else background_image
+        return None
+
+def add_text_to_image(image, text, font_size=24, color="white", position="bottom", outline_color="black"):
+    """Add text to an image with optional outline"""
+    try:
+        # Convert to PIL Image if it's not already
+        if not isinstance(image, Image.Image):
+            image = Image.open(image)
+            
+        # Create a copy of the image to avoid modifying the original
+        img_with_text = image.copy()
+        
+        # Create a drawing context
+        draw = ImageDraw.Draw(img_with_text)
+        
+        # Try to load a font, fall back to default if not available
+        try:
+            # Try to find a system font
+            import matplotlib.font_manager as fm
+            system_fonts = fm.findSystemFonts()
+            if system_fonts:
+                # Use the first available font
+                font = ImageFont.truetype(system_fonts[0], font_size)
+            else:
+                font = ImageFont.load_default()
+                font_size = 16  # Default font size
+        except Exception as e:
+            print(f"Error loading font: {e}")
+            font = ImageFont.load_default()
+            font_size = 16  # Default font size
+        
+        # Get image dimensions
+        width, height = img_with_text.size
+        
+        # Calculate text size
+        try:
+            text_width, text_height = draw.textsize(text, font=font)
+        except:
+            # For newer Pillow versions
+            text_width, text_height = draw.textbbox((0, 0), text, font=font)[2:4]
+        
+        # Determine text position based on the specified position
+        if position == "top":
+            text_position = ((width - text_width) // 2, 10)
+        elif position == "bottom":
+            text_position = ((width - text_width) // 2, height - text_height - 10)
+        elif position == "left":
+            text_position = (10, (height - text_height) // 2)
+        elif position == "right":
+            text_position = (width - text_width - 10, (height - text_height) // 2)
+        elif position == "center":
+            text_position = ((width - text_width) // 2, (height - text_height) // 2)
+        else:
+            # Default to bottom if position is not recognized
+            text_position = ((width - text_width) // 2, height - text_height - 10)
+        
+        # Draw text outline if outline color is provided
+        if outline_color:
+            # Draw text multiple times with small offsets to create outline effect
+            for offset_x, offset_y in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
+                draw.text(
+                    (text_position[0] + offset_x, text_position[1] + offset_y),
+                    text,
+                    font=font,
+                    fill=outline_color
+                )
+        
+        # Draw the main text
+        draw.text(
+            text_position,
+            text,
+            font=font,
+            fill=color
+        )
+        
+        return img_with_text
+        
+    except Exception as e:
+        print(f"Error adding text to image: {e}")
+        # Return the original image if there's an error
+        return image
+
+# Cache for OpenAI generated backgrounds to avoid duplicate API calls
+BACKGROUND_CACHE = {}
+
+# Performance metrics
+API_METRICS = {
+    "total_requests": 0,
+    "avg_response_time": 0,
+    "cache_hits": 0,
+    "cache_misses": 0
+}
+
+def generate_background_image(description, size=(1024, 1024)):
+    """Generate a background image using DALL-E 2 based on the description"""
+    # Check cache first
+    cache_key = description.lower().strip()
+    if cache_key in BACKGROUND_CACHE and "image_data" in BACKGROUND_CACHE[cache_key]:
+        print(f"Using cached background image for '{description}'")
+        API_METRICS["cache_hits"] += 1
+        image_data = BACKGROUND_CACHE[cache_key]["image_data"]
+        return Image.open(BytesIO(image_data))
+    
+    API_METRICS["cache_misses"] += 1
+    
+    if not aiml_api_key:
+        print("No OpenAI API key provided, cannot generate background image")
+        return None
+    
+    try:
+        # Create a minimal prompt for the image generation
+        prompt = f"{description} background"
+        print(f"Generating image for prompt: {prompt}")
+        
+        # Generate image with DALL-E
+        response = aiml_client.images.generate(
+            model="dall-e-2",  # Using DALL-E 2 for compatibility
+            prompt=prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1,
+        )
+        
+        # Get the image URL
+        image_url = response.data[0].url
+        
+        # Download the image
+        response = requests.get(image_url)
+        if response.status_code == 200:
+            # Cache the image data
+            if cache_key not in BACKGROUND_CACHE:
+                BACKGROUND_CACHE[cache_key] = {}
+            BACKGROUND_CACHE[cache_key]["image_data"] = response.content
+            BACKGROUND_CACHE[cache_key]["image_url"] = image_url
+            
+            # Create a PIL Image
+            image = Image.open(BytesIO(response.content))
+            
+            # Resize if needed
+            if image.size != size:
+                image = image.resize(size, Image.LANCZOS)
+            
+            return image
+        else:
+            print(f"Failed to download image from {image_url}")
+            return None
+    except Exception as e:
+        print(f"Error generating background image: {e}")
+        return None
+
+@run_in_threadpool
+def process_suggestion(suggestion):
+    try:
+        # Generate background image
+        background_image = generate_background_image(suggestion['description'])
+        if background_image is None:
+            return None
+        name = suggestion['name'].lower().strip()
+        if name not in seen_names and name not in existing_suggestion_names:
+            seen_names.add(name)
+            unique_user_suggestions.append(suggestion)
+    
+    # Process suggestions in parallel
+    tasks = []
+    for suggestion in unique_user_suggestions:
+        tasks.append(process_suggestion(suggestion))
+    
+    suggestions_with_images = await asyncio.gather(*tasks)
+    suggestions_with_images = [s for s in suggestions_with_images if s is not None]
+    
+    # Add the new suggestions with image URLs (only if they're not duplicates)
+    if suggestions_with_images:
+{{ ... }}
+        existing_names = {s.get('name', '').lower().strip() for s in IMAGE_METADATA[image_id]['background_suggestions']}
+        
+        # Only add suggestions that don't already exist
+        unique_new_suggestions = [s for s in suggestions_with_images 
+                               if s.get('name', '').lower().strip() not in existing_names]
+        
+        # Add suggestions to metadata in background to not block response
+        def add_suggestions_to_metadata():
+            IMAGE_METADATA[image_id]['background_suggestions'].extend(unique_new_suggestions)
+        
+        background_tasks.add_task(add_suggestions_to_metadata)
+    else:
+        unique_new_suggestions = []
+    
+    # Calculate performance metrics
+    elapsed_time = time.time() - start_time
+    API_METRICS["avg_response_time"] = ((API_METRICS["avg_response_time"] * (API_METRICS["total_requests"]-1)) + elapsed_time) / API_METRICS["total_requests"]
+    
+    return {
+        "success": True,
+        "image_id": image_id,
+        "cropped_image_url": cropped_image_url,  
+        "clean_image_url": clean_image_url,     
+        "extracted_image_url": extracted_image_url, 
+        "suggestions_added": len(unique_new_suggestions),
+        "total_suggestions": len(IMAGE_METADATA[image_id]['background_suggestions']) + len(unique_new_suggestions),
+        "suggestions": unique_new_suggestions,
+        "performance": {
+            "response_time_ms": round(elapsed_time * 1000, 2),
+            "cache_hits": API_METRICS["cache_hits"],
+            "cache_misses": API_METRICS["cache_misses"]
+        }
+    }
